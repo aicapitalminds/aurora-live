@@ -1,0 +1,46 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# Local launchers may contain API keys or machine-specific paths
+start-aurora.bat
+*.local.bat
+*.local.ps1
+
+# Runtime logs/cache
+*.log
+watchdog.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+.envrc
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large/local captures
+captures/
+recordings/
+screenshots/
+*.wav
+*.mp3
+*.mp4
+*.mov
+
+# Keep docs/examples safe for GitHub
