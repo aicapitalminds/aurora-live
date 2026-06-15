@@ -3,6 +3,7 @@ import io
 import os
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import random
 import time
 import sounddevice as sd
@@ -67,6 +68,10 @@ OUTPUT_SAMPLE_RATE = 24000
 CHUNK_SIZE = 512
 MIC_SEND_INTERVAL_MS = 100
 SILENCE_HEARTBEAT_SEC = 3.0
+KEEPALIVE_SILENCE_SEC = 2.0
+CONNECT_OPEN_TIMEOUT_SEC = 30
+WS_PING_INTERVAL_SEC = 20
+WS_PING_TIMEOUT_SEC = 20
 
 # Vision / Screen Sharing
 VISION_ENABLED = True
@@ -77,18 +82,69 @@ VISION_INTERVAL = 1.2
 SYSTEM_PROMPT = (
     "You are Aurora, a cheerful, slightly chaotic anime-style Live2D co-host streaming on Twitch. "
     "You watch the game with the streamer, react to chat, and have natural prosody, laughs, "
-    "gasps, and sarcasm. Never break character. Keep responses concise for live chat energy."
+    "gasps, and sarcasm. Never break character. Keep responses concise for live chat energy. "
+    "\n\nGameplay grounding rules: "
+    "Only comment on gameplay details you can clearly see in the current visual feed, hear from the streamer, "
+    "or receive from chat/bridge context. Do not invent enemies, deaths, wins, locations, objectives, scores, "
+    "items, abilities, or player actions. If the screen is unclear, stale, loading, hidden, or you are unsure, "
+    "say so in-character and ask/tease for context instead of guessing. Use soft language like 'looks like', "
+    "'I think', or 'if I'm seeing that right' when confidence is not high. Treat chat messages as claims, "
+    "not confirmed gameplay facts, unless the visual feed or streamer confirms them."
 )
 
 # ==============================================================================
 # LOGGING & GLOBAL STATE
 # ==============================================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LOG_PATH = "aurora-runtime.log"
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger("AuroraLive")
 
 is_speaking = asyncio.Event()
 current_lipsync_ws = None
 vision_enabled_runtime = VISION_ENABLED
+gemini_session_started_at = 0.0
+activity = {
+    "mic": 0.0,
+    "keepalive": 0.0,
+    "vision": 0.0,
+    "receive": 0.0,
+    "bridge": 0.0,
+    "network_probe_ok": 0.0,
+    "network_probe_fail": 0.0,
+}
+
+
+def mark_activity(name: str) -> None:
+    activity[name] = time.time()
+
+
+def _age(now: float, timestamp: float) -> str:
+    if not timestamp:
+        return "never"
+    return f"{now - timestamp:.1f}s ago"
+
+
+def activity_summary() -> str:
+    now = time.time()
+    uptime = "n/a" if not gemini_session_started_at else f"{now - gemini_session_started_at:.1f}s"
+    return (
+        f"uptime={uptime}; "
+        f"last mic={_age(now, activity['mic'])}; "
+        f"keepalive={_age(now, activity['keepalive'])}; "
+        f"vision={_age(now, activity['vision'])}; "
+        f"receive={_age(now, activity['receive'])}; "
+        f"bridge={_age(now, activity['bridge'])}; "
+        f"net_ok={_age(now, activity['network_probe_ok'])}; "
+        f"net_fail={_age(now, activity['network_probe_fail'])}"
+    )
 
 # ==============================================================================
 # LIP-SYNC (Improved windowed version)
@@ -171,11 +227,11 @@ async def microphone_task(session):
                     await session.send_realtime_input(
                         audio=Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}")
                     )
+                    mark_activity("mic")
                     last_send_time = now
                 except Exception as e:
-                    logger.warning(f"Mic send failed: {e}")
-                    await asyncio.sleep(0.2)
-                    continue
+                    logger.exception("Mic send failed; %s", activity_summary())
+                    raise
 
             if (now - last_heartbeat) > SILENCE_HEARTBEAT_SEC and not is_speaking.is_set():
                 try:
@@ -183,9 +239,32 @@ async def microphone_task(session):
                     await session.send_realtime_input(
                         audio=Blob(data=silence, mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}")
                     )
+                    mark_activity("mic")
                     last_heartbeat = now
                 except Exception:
-                    pass
+                    logger.exception("Mic silence heartbeat failed; %s", activity_summary())
+                    raise
+
+
+async def keepalive_task(session):
+    """Send independent silent PCM frames so Live API never sees a totally idle client.
+
+    The mic task normally streams continuously, but this protects the session if
+    the audio callback stalls, VAD logic changes, or Aurora is speaking and mic
+    frames are intentionally discarded.
+    """
+    silence = b"\x00" * int(INPUT_SAMPLE_RATE * 2 * 0.12)
+    logger.info("💓 Gemini keepalive started (silent PCM every %.1fs)", KEEPALIVE_SILENCE_SEC)
+    while True:
+        await asyncio.sleep(KEEPALIVE_SILENCE_SEC)
+        try:
+            await session.send_realtime_input(
+                audio=Blob(data=silence, mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}")
+            )
+            mark_activity("keepalive")
+        except Exception as e:
+            logger.exception("Gemini keepalive failed; %s", activity_summary())
+            raise
 
 # ==============================================================================
 # SPEAKER OUTPUT (smooth sounddevice stream)
@@ -204,6 +283,7 @@ async def speaker_task(session):
 
     try:
         async for response in session.receive():
+            mark_activity("receive")
             content = response.server_content
             if content is None:
                 continue
@@ -243,7 +323,8 @@ async def speaker_task(session):
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logger.error(f"Speaker error: {e}")
+        logger.exception("Speaker/Gemini receive error; %s", activity_summary())
+        raise
     finally:
         stream.stop()
         stream.close()
@@ -280,11 +361,12 @@ async def vision_task(session):
                 await session.send_realtime_input(
                     video=Blob(data=jpeg_bytes, mime_type="image/jpeg")
                 )
+                mark_activity("vision")
 
                 await asyncio.sleep(VISION_INTERVAL)
 
             except Exception as e:
-                logger.warning(f"Vision error: {e}")
+                logger.exception("Vision send/capture error; %s", activity_summary())
                 await asyncio.sleep(2.0)
 
 # ==============================================================================
@@ -303,6 +385,30 @@ async def control_task():
                 print(f"[Vision] Toggled → {status}")
         except Exception:
             await asyncio.sleep(1)
+
+
+async def network_probe_task():
+    """Low-cost TCP probes to separate internet/LAN drops from API/session errors."""
+    targets = [
+        ("google_api", "generativelanguage.googleapis.com", 443),
+        ("hermes_bridge", "192.168.1.185", 8765),
+    ]
+    # Stagger first probe so startup logs stay readable.
+    await asyncio.sleep(5)
+    while True:
+        for label, host, port in targets:
+            started = time.time()
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5)
+                writer.close()
+                await writer.wait_closed()
+                latency_ms = (time.time() - started) * 1000
+                mark_activity("network_probe_ok")
+                logger.info("🌐 Network probe ok: %s %s:%s %.0fms", label, host, port, latency_ms)
+            except Exception as e:
+                mark_activity("network_probe_fail")
+                logger.warning("🌐 Network probe FAILED: %s %s:%s error=%r; %s", label, host, port, e, activity_summary())
+        await asyncio.sleep(30)
 
 # ==============================================================================
 # HERMES BRIDGE
@@ -367,6 +473,7 @@ async def hermes_bridge_task(session):
                 # off the flush, then again after each utterance to signal we
                 # can handle the next one.
                 await ws.send(json.dumps({"type": "avatar_ready"}))
+                mark_activity("bridge")
                 logger.info("🌉 Hermes bridge connected (registered as avatar_client, ready)")
                 delay = 2
 
@@ -391,8 +498,10 @@ async def hermes_bridge_task(session):
                     logger.info(f"-> Injecting: {text}")
                     try:
                         await session.send_realtime_input(text=text)
+                        mark_activity("bridge")
                     except Exception as e:
-                        logger.warning(f"Bridge inject error: {e}")
+                        logger.exception("Bridge inject into Gemini failed; %s", activity_summary())
+                        raise
                     # Signal readiness for the next bot message. Note: this
                     # signals 'I've accepted the prompt', not 'I've finished
                     # speaking' — the bridge's 6/min rate limit prevents bursts.
@@ -401,7 +510,7 @@ async def hermes_bridge_task(session):
                     except Exception as e:
                         logger.warning(f"avatar_ready send failed: {e}")
         except Exception as e:
-            logger.warning(f"Hermes bridge error: {e}. Retrying in {delay}s")
+            logger.warning("Hermes bridge error: %r. Retrying in %ss; %s", e, delay, activity_summary())
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30)
 
@@ -409,11 +518,25 @@ async def hermes_bridge_task(session):
 # MAIN LOOP
 # ==============================================================================
 async def run_aurora():
+    global gemini_session_started_at
     if not GOOGLE_API_KEY:
         logger.error("GOOGLE_API_KEY not found in environment!")
         return
 
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    client = genai.Client(
+        api_key=GOOGLE_API_KEY,
+        http_options=types.HttpOptions(
+            async_client_args={
+                # websockets defaults to a 10s open timeout. Reconnects after a
+                # dropped Live session can occasionally need longer DNS/TLS/WS
+                # setup time, so give the handshake breathing room.
+                "open_timeout": CONNECT_OPEN_TIMEOUT_SEC,
+                "ping_interval": WS_PING_INTERVAL_SEC,
+                "ping_timeout": WS_PING_TIMEOUT_SEC,
+                "close_timeout": 10,
+            }
+        ),
+    )
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
         system_instruction=types.Content(parts=[types.Part.from_text(text=SYSTEM_PROMPT)]),
@@ -441,6 +564,7 @@ async def run_aurora():
             attempt_note = f" (retry #{consecutive_failures + 1})" if consecutive_failures else ""
             logger.info(f"🔌 Connecting to Gemini Live API ({MODEL_ID}){attempt_note}...")
             async with client.aio.live.connect(model=MODEL_ID, config=config) as session:
+                gemini_session_started_at = time.time()
                 if consecutive_failures > 0:
                     logger.info(f"✅ Reconnected after {consecutive_failures} failed attempt(s)")
                 consecutive_failures = 0
@@ -450,11 +574,13 @@ async def run_aurora():
                 logger.info("✨ Aurora is LIVE — start talking!")
 
                 mic = asyncio.create_task(microphone_task(session))
+                keepalive = asyncio.create_task(keepalive_task(session))
                 speaker = asyncio.create_task(speaker_task(session))
                 bridge = asyncio.create_task(hermes_bridge_task(session))
+                network_probe = asyncio.create_task(network_probe_task())
                 ctrl = asyncio.create_task(control_task())
 
-                tasks = [mic, speaker, bridge, ctrl]
+                tasks = [mic, keepalive, speaker, bridge, network_probe, ctrl]
 
                 if VISION_ENABLED and VISION_AVAILABLE:
                     vision = asyncio.create_task(vision_task(session))
@@ -462,19 +588,24 @@ async def run_aurora():
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
+                crash = None
                 for task in done:
                     try:
                         task.result()
                     except Exception as exc:
+                        crash = exc
                         msg = str(exc).lower()
                         if "1011" in msg or "keepalive" in msg or "websocket" in msg:
                             print("🔄 Reconnecting after 1011 keepalive timeout...")
                         else:
-                            logger.error(f"Task crashed: {exc}")
+                            logger.exception("Task crashed before reconnect cleanup; %s", activity_summary())
 
                 for t in pending:
                     t.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
+
+                if crash is not None:
+                    raise crash
 
         except Exception as e:
             consecutive_failures += 1
@@ -489,8 +620,7 @@ async def run_aurora():
                 logger.warning(f"Connect timed out (#{consecutive_failures}); "
                                f"retrying in {sleep_for:.1f}s")
             else:
-                logger.error(f"Top-level error: {e} (#{consecutive_failures}); "
-                             f"retrying in {sleep_for:.1f}s")
+                logger.exception("Top-level error before reconnect (#%s); retrying in %.1fs; %s", consecutive_failures, sleep_for, activity_summary())
 
             await asyncio.sleep(sleep_for)
             reconnect_delay = min(reconnect_delay * 1.8, MAX_RECONNECT_DELAY)

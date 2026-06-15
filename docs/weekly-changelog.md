@@ -2,6 +2,15 @@
 
 Use this file for human-readable weekly notes before/after each GitHub save.
 
+## 2026-06-15
+
+### Weekly backup summary
+
+- Updated `aurora-live.py` with the latest runtime and interaction changes.
+- Added browser viewer prototypes: `aurora-codex-viewer.html`, `aurora-rodin-viewer.html`, and `rodin-models/rodin-preview.html`.
+- Added new avatar/model asset folders for Live2D packaging and Rodin exports: `codex-avatar-assets/` and `rodin-models/`.
+- Added `start-rodin-viewer-server.bat` for local viewer serving and `video-inspect/` reference frames for inspection.
+
 ## 2026-05-16
 
 ### Repository safety setup
