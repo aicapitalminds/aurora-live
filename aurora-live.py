@@ -13,6 +13,13 @@ from google import genai
 from google.genai import types
 from google.genai.types import Blob
 
+from aurora_unreal_bridge import (
+    AuroraAvatarState,
+    UnrealAvatarBridge,
+    safe_send_lipsync,
+    safe_set_state,
+)
+
 # Vision imports
 try:
     import mss
@@ -61,6 +68,7 @@ print(f"🎙️  Mic     -> index {MIC_DEVICE_INDEX}: {sd.query_devices(MIC_DEVI
 print(f"🔊 Speaker -> index {SPEAKER_DEVICE_INDEX}: {sd.query_devices(SPEAKER_DEVICE_INDEX)['name']}")
 
 LIPSYNC_WS_PORT = 8770
+UNREAL_AVATAR_WS_PORT = 8771
 HERMES_BRIDGE_URL = "ws://192.168.1.185:8765"
 
 INPUT_SAMPLE_RATE = 16000
@@ -109,6 +117,7 @@ logger = logging.getLogger("AuroraLive")
 
 is_speaking = asyncio.Event()
 current_lipsync_ws = None
+unreal_avatar_bridge = UnrealAvatarBridge(port=UNREAL_AVATAR_WS_PORT)
 vision_enabled_runtime = VISION_ENABLED
 gemini_session_started_at = 0.0
 activity = {
@@ -162,8 +171,6 @@ async def lip_sync_handler(websocket):
         logger.info("👄 Lip-sync client disconnected")
 
 async def send_lip_sync(audio_bytes: bytes):
-    if current_lipsync_ws is None:
-        return
     try:
         samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
         if samples.size == 0:
@@ -180,11 +187,13 @@ async def send_lip_sync(audio_bytes: bytes):
                 values.append(volume)
 
         if values:
-            payload = json.dumps({"mouthOpenY": values, "windowMs": LIPSYNC_WINDOW_MS})
-            await current_lipsync_ws.send(payload)
+            if current_lipsync_ws is not None:
+                payload = json.dumps({"mouthOpenY": values, "windowMs": LIPSYNC_WINDOW_MS})
+                await current_lipsync_ws.send(payload)
+            await safe_send_lipsync(unreal_avatar_bridge, values, LIPSYNC_WINDOW_MS)
 
     except Exception:
-        pass
+        logger.exception("Lip-sync dispatch failed")
 
 # ==============================================================================
 # MICROPHONE (VAD aware)
@@ -291,6 +300,7 @@ async def speaker_task(session):
             if content.interrupted:
                 if is_speaking.is_set():
                     is_speaking.clear()
+                    await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING)
                     print("✅ Mic resumed")
                 continue
 
@@ -299,14 +309,16 @@ async def speaker_task(session):
                 for part in content.model_turn.parts:
                     if part.text:
                         print(part.text, end="", flush=True)
+                        await unreal_avatar_bridge.send_text(part.text, partial=True)
                     if part.inline_data:
                         audio = part.inline_data.data
                         if not is_speaking.is_set():
                             is_speaking.set()
+                            await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.SPEAKING)
                             print("🎤 Mic paused during Aurora reply")
                         
                         audio_array = np.frombuffer(audio, dtype=np.int16)
-                        stream.write(audio_array)
+                        await asyncio.to_thread(stream.write, audio_array)
                         
                         await send_lip_sync(audio)
                         total_bytes += len(audio)
@@ -317,6 +329,7 @@ async def speaker_task(session):
             if getattr(content, "turn_complete", False):
                 if is_speaking.is_set():
                     is_speaking.clear()
+                    await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING)
                     print("✅ Mic resumed")
                 print("🔄 Turn complete")
 
@@ -330,6 +343,7 @@ async def speaker_task(session):
         stream.close()
         if is_speaking.is_set():
             is_speaking.clear()
+        await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.IDLE)
 
 # ==============================================================================
 # VISION
@@ -497,6 +511,7 @@ async def hermes_bridge_task(session):
 
                     logger.info(f"-> Injecting: {text}")
                     try:
+                        await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.THINKING)
                         await session.send_realtime_input(text=text)
                         mark_activity("bridge")
                     except Exception as e:
@@ -549,6 +564,8 @@ async def run_aurora():
 
     await websockets.serve(lip_sync_handler, "localhost", LIPSYNC_WS_PORT)
     logger.info(f"👄 Lip-sync WebSocket server started on port {LIPSYNC_WS_PORT}")
+    await unreal_avatar_bridge.start()
+    await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.IDLE, force=True)
 
     # Reconnect backoff: starts polite, grows exponentially with jitter, caps at 30s.
     # Both state variables are RESET inside the async-with on a successful connect, so
@@ -572,6 +589,7 @@ async def run_aurora():
 
                 print("✅ New Gemini Live session ready")
                 logger.info("✨ Aurora is LIVE — start talking!")
+                await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING, force=True)
 
                 mic = asyncio.create_task(microphone_task(session))
                 keepalive = asyncio.create_task(keepalive_task(session))
@@ -628,6 +646,7 @@ async def run_aurora():
         finally:
             if is_speaking.is_set():
                 is_speaking.clear()
+            await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.IDLE)
             await asyncio.sleep(0.4)
 
 # ==============================================================================
