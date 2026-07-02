@@ -13,10 +13,22 @@ from google import genai
 from google.genai import types
 from google.genai.types import Blob
 
+from aurora_connectors import (
+    get_market_summary,
+    get_weather_summary,
+    maybe_handle_connector,
+    open_browser_url,
+    web_search_summary,
+)
+from aurora_pc_control import APP_WHITELIST, MEDIA_ACTIONS, pc_control
+from aurora_gemini_session import GeminiLiveSessionStore
+from aurora_memory import AuroraMemoryStore
 from aurora_unreal_bridge import (
     AuroraAvatarState,
     UnrealAvatarBridge,
+    safe_send_audio_pcm,
     safe_send_lipsync,
+    safe_send_lipsync_prewarm,
     safe_set_state,
 )
 
@@ -78,27 +90,84 @@ MIC_SEND_INTERVAL_MS = 100
 SILENCE_HEARTBEAT_SEC = 3.0
 KEEPALIVE_SILENCE_SEC = 2.0
 CONNECT_OPEN_TIMEOUT_SEC = 30
-WS_PING_INTERVAL_SEC = 20
-WS_PING_TIMEOUT_SEC = 20
+# Disable websockets protocol-level pings for Gemini Live. In high-frequency
+# audio/video streams these can false-timeout while the event loop is busy or
+# the upstream stalls, causing 1011 keepalive disconnects around ~50s. We rely
+# on app-level mic/vision/keepalive frames plus Gemini goAway/session-resume.
+WS_PING_INTERVAL_SEC = None
+WS_PING_TIMEOUT_SEC = None
+GEMINI_SESSION_STATE_PATH = "aurora-gemini-session-state.json"
+AURORA_MEMORY_ROOT = "memory"
+ENABLE_GEMINI_SESSION_RESUMPTION = False  # OFF for voice-only stability tests; avoids restoring old visual context.
+ENABLE_GEMINI_CONTEXT_COMPRESSION = True
+UNREAL_PCM_AUDIO_ENABLED = True
+# Native Google Search grounding. Broke the Live handshake (1011 loops) on
+# google-genai 2.3.0 — upgrade to >= 2.10 before enabling. Flip to False if
+# handshake loops return.
+ENABLE_GOOGLE_SEARCH = False  # Native grounding needs paid quota (1011 'exceeded quota' at handshake). Using free local web_search tool instead.
 
 # Vision / Screen Sharing
-VISION_ENABLED = True
+# Keep OFF for voice stability tests. Continuous full-monitor JPEG streaming can
+# exhaust Live API audio-video limits or stall weak network paths quickly. Toggle
+# with `v` once basic voice is stable.
+VISION_ENABLED = False
 VISION_MODE = "monitor"
 VISION_WINDOW_TITLE = ""
-VISION_INTERVAL = 1.2
+VISION_INTERVAL = 3.0
+VISION_JPEG_QUALITY = 45
+VISION_MAX_WIDTH = 1280
 
-SYSTEM_PROMPT = (
-    "You are Aurora, a cheerful, slightly chaotic anime-style Live2D co-host streaming on Twitch. "
-    "You watch the game with the streamer, react to chat, and have natural prosody, laughs, "
-    "gasps, and sarcasm. Never break character. Keep responses concise for live chat energy. "
+BASE_SYSTEM_PROMPT = (
+    "You are Aurora, a cheerful, slightly chaotic anime-style Live2D co-host streaming on Twitch with Attila. "
+    "You watch the game with him, react to chat, and speak with natural prosody, laughs, gasps, and sarcasm. "
+    "Never break character."
+    "\n\nPersonality: "
+    "You love roguelikes and anything with a good loot loop; you get visibly hyped over rare drops. "
+    "Your pet peeve is players who hoard consumables and never use them — call it out and tease. "
+    "You have friendly-rival energy with Attila: you tease him about deaths and misplays, but you're "
+    "the first to hype his clutch moments. You keep a running gag of blaming lag for anything embarrassing "
+    "that happens to YOU. You have opinions and state them — a co-host with no takes is boring. "
+    "You're a bit of a gremlin about snacks and stream drama, but never mean-spirited toward chat."
+    "\n\nResponse style: "
+    "Match your length to the moment. Chat reactions and gameplay quips: one short punchy line. "
+    "Direct questions from Attila or chat: 2-3 sentences. Only go longer when explicitly asked to explain "
+    "something. Vary your openings — don't start every reply the same way."
+    "\n\nWhen unsure, redirect: if you can't see or don't know something, don't stall — throw it to chat "
+    "('okay chat, someone back me up here'), ask Attila directly, or make a playful guess clearly labeled "
+    "as a guess. Always have a move."
     "\n\nGameplay grounding rules: "
     "Only comment on gameplay details you can clearly see in the current visual feed, hear from the streamer, "
     "or receive from chat/bridge context. Do not invent enemies, deaths, wins, locations, objectives, scores, "
-    "items, abilities, or player actions. If the screen is unclear, stale, loading, hidden, or you are unsure, "
+    "items, abilities, or player actions. If the screen is unclear, stale, loading, hidden, disabled, or you are unsure, "
     "say so in-character and ask/tease for context instead of guessing. Use soft language like 'looks like', "
     "'I think', or 'if I'm seeing that right' when confidence is not high. Treat chat messages as claims, "
     "not confirmed gameplay facts, unless the visual feed or streamer confirms them."
+    "\n\nTool rules: When the user asks for weather, call get_weather with the best location. "
+    "When the user explicitly asks to open a browser or URL, call open_browser. "
+    "When the user says activate/enable/turn on vision, call set_vision with enabled=true. "
+    "When the user says disable/deactivate/turn off vision, call set_vision with enabled=false. "
+    "For current events, live facts, game news, patch notes, or anything you don't know, call web_search "
+    "with a focused query and answer from the results instead of guessing or saying you can't look things up. "
+    "When the user asks about markets, stocks, crypto, or the market forecast, call get_market_brief. "
+    "When the user asks to control music, volume, or open an app, call pc_control with the right action. "
+    "After a tool result, summarize it naturally and briefly in-character."
 )
+
+
+
+def current_system_prompt() -> str:
+    if vision_enabled_runtime:
+        vision_note = (
+            "\n\nCurrent runtime vision status: ON. You may comment on the live screen only when the visual feed is fresh and clear."
+        )
+    else:
+        vision_note = (
+            "\n\nCurrent runtime vision status: OFF. You cannot see the screen right now. "
+            "Do not describe the screen, gameplay, desktop, code, windows, or images from memory. "
+            "If asked what you see, say that your visual feed is disabled for stability testing and ask the user to describe it or press v to enable vision."
+        )
+    memory_context = aurora_memory_store.load_startup_memory(max_chars=5000)
+    return BASE_SYSTEM_PROMPT + "\n\n[Long-term memory]\n" + memory_context + vision_note
 
 # ==============================================================================
 # LOGGING & GLOBAL STATE
@@ -118,8 +187,11 @@ logger = logging.getLogger("AuroraLive")
 is_speaking = asyncio.Event()
 current_lipsync_ws = None
 unreal_avatar_bridge = UnrealAvatarBridge(port=UNREAL_AVATAR_WS_PORT)
+gemini_session_store = GeminiLiveSessionStore(GEMINI_SESSION_STATE_PATH)
+aurora_memory_store = AuroraMemoryStore(AURORA_MEMORY_ROOT)
 vision_enabled_runtime = VISION_ENABLED
 gemini_session_started_at = 0.0
+unreal_audio_seq = 0
 activity = {
     "mic": 0.0,
     "keepalive": 0.0,
@@ -266,6 +338,8 @@ async def keepalive_task(session):
     logger.info("💓 Gemini keepalive started (silent PCM every %.1fs)", KEEPALIVE_SILENCE_SEC)
     while True:
         await asyncio.sleep(KEEPALIVE_SILENCE_SEC)
+        if is_speaking.is_set():
+            continue
         try:
             await session.send_realtime_input(
                 audio=Blob(data=silence, mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}")
@@ -279,8 +353,9 @@ async def keepalive_task(session):
 # SPEAKER OUTPUT (smooth sounddevice stream)
 # ==============================================================================
 async def speaker_task(session):
+    global unreal_audio_seq, vision_enabled_runtime
     logger.info(f"🔊 Opening speaker (index {SPEAKER_DEVICE_INDEX})")
-    
+
     stream = sd.OutputStream(
         samplerate=OUTPUT_SAMPLE_RATE,
         channels=1,
@@ -290,52 +365,134 @@ async def speaker_task(session):
     )
     stream.start()
 
+    # Auto-capture buffers: transcription arrives in fragments; flush per turn.
+    user_transcript = ""
+    aurora_transcript = ""
+
+    async def flush_transcripts():
+        nonlocal user_transcript, aurora_transcript
+        if user_transcript:
+            await asyncio.to_thread(aurora_memory_store.append_transcript, "Attila", user_transcript)
+            user_transcript = ""
+        if aurora_transcript:
+            await asyncio.to_thread(aurora_memory_store.append_transcript, "Aurora", aurora_transcript)
+            aurora_transcript = ""
+
     try:
-        async for response in session.receive():
-            mark_activity("receive")
-            content = response.server_content
-            if content is None:
-                continue
+        while True:
+            received_any = False
+            async for response in session.receive():
+                received_any = True
+                mark_activity("receive")
 
-            if content.interrupted:
-                if is_speaking.is_set():
-                    is_speaking.clear()
-                    await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING)
-                    print("✅ Mic resumed")
-                continue
+                tool_call = getattr(response, "tool_call", None)
+                if tool_call is not None:
+                    await handle_tool_call(session, tool_call)
+                    continue
 
-            if content.model_turn:
-                total_bytes = 0
-                for part in content.model_turn.parts:
-                    if part.text:
-                        print(part.text, end="", flush=True)
-                        await unreal_avatar_bridge.send_text(part.text, partial=True)
-                    if part.inline_data:
-                        audio = part.inline_data.data
-                        if not is_speaking.is_set():
-                            is_speaking.set()
-                            await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.SPEAKING)
-                            print("🎤 Mic paused during Aurora reply")
-                        
-                        audio_array = np.frombuffer(audio, dtype=np.int16)
-                        await asyncio.to_thread(stream.write, audio_array)
-                        
-                        await send_lip_sync(audio)
-                        total_bytes += len(audio)
+                session_update = getattr(response, "session_resumption_update", None)
+                if session_update is not None and ENABLE_GEMINI_SESSION_RESUMPTION:
+                    resumable = bool(getattr(session_update, "resumable", False))
+                    new_handle = getattr(session_update, "new_handle", None)
+                    if resumable and new_handle:
+                        changed = gemini_session_store.update_handle(new_handle, model=MODEL_ID)
+                        if changed:
+                            logger.info("🔁 Saved Gemini session resume handle generation=%s", gemini_session_store.state.generation)
 
-                if total_bytes > 0:
-                    print(f"\n✅ Aurora replied with {total_bytes} bytes")
+                go_away = getattr(response, "go_away", None)
+                if go_away is not None:
+                    time_left = getattr(go_away, "time_left", None)
+                    gemini_session_store.record_go_away(time_left)
+                    logger.warning("🔁 Gemini goAway received; time_left=%s. Triggering proactive reconnect.", time_left)
+                    raise RuntimeError(f"Gemini goAway received; time_left={time_left}")
 
-            if getattr(content, "turn_complete", False):
-                if is_speaking.is_set():
-                    is_speaking.clear()
-                    await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING)
-                    print("✅ Mic resumed")
-                print("🔄 Turn complete")
+                content = response.server_content
+                if content is None:
+                    continue
+
+                in_tx = getattr(content, "input_transcription", None)
+                if in_tx is not None and getattr(in_tx, "text", None):
+                    user_transcript += in_tx.text
+                out_tx = getattr(content, "output_transcription", None)
+                if out_tx is not None and getattr(out_tx, "text", None):
+                    aurora_transcript += out_tx.text
+
+                if content.interrupted:
+                    await flush_transcripts()  # keep partial speech when user cuts in
+                    if is_speaking.is_set():
+                        is_speaking.clear()
+                        await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING)
+                        print("✅ Mic resumed")
+                    continue
+
+                if content.model_turn:
+                    if not is_speaking.is_set():
+                        await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.THINKING)
+                    total_bytes = 0
+                    for part in content.model_turn.parts:
+                        if part.text:
+                            print(part.text, end="", flush=True)
+                            await unreal_avatar_bridge.send_text(part.text, partial=True)
+                        if part.inline_data:
+                            audio = part.inline_data.data
+                            if not is_speaking.is_set():
+                                is_speaking.set()
+                                await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.SPEAKING)
+                                print("🎤 Mic paused during Aurora reply")
+
+                            audio_array = np.frombuffer(audio, dtype=np.int16)
+                            await asyncio.to_thread(stream.write, audio_array)
+
+                            if UNREAL_PCM_AUDIO_ENABLED:
+                                # Send in small ~20ms frames. Unreal's standalone/packaged
+                                # websocket drops large single messages (worked in-editor only);
+                                # small frames deliver reliably. 20ms @ 24kHz mono int16 = 960 bytes.
+                                _pcm_frame_bytes = int(OUTPUT_SAMPLE_RATE * 0.02) * 2
+                                for _off in range(0, len(audio), _pcm_frame_bytes):
+                                    _chunk = audio[_off:_off + _pcm_frame_bytes]
+                                    if not _chunk:
+                                        continue
+                                    unreal_audio_seq += 1
+                                    await safe_send_audio_pcm(
+                                        unreal_avatar_bridge,
+                                        _chunk,
+                                        sample_rate=OUTPUT_SAMPLE_RATE,
+                                        channels=1,
+                                        sample_format="int16",
+                                        sequence=unreal_audio_seq,
+                                    )
+
+                            await send_lip_sync(audio)
+                            total_bytes += len(audio)
+
+                    if total_bytes > 0:
+                        print(f"\n✅ Aurora replied with {total_bytes} bytes")
+
+                if getattr(content, "turn_complete", False):
+                    await flush_transcripts()
+                    if is_speaking.is_set():
+                        is_speaking.clear()
+                        await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING)
+                        print("✅ Mic resumed")
+                    print("🔄 Turn complete")
+
+            # Some google-genai versions end the receive iterator after a model
+            # turn/generation completes. That is not a dead session; keep the
+            # receiver task alive so the supervisor doesn't reconnect after every
+            # normal answer.
+            logger.info("Gemini receive iterator ended normally (received_any=%s); continuing listener", received_any)
+            await asyncio.sleep(0.05)
 
     except asyncio.CancelledError:
         pass
     except Exception as e:
+        if "1007" in str(e) and vision_enabled_runtime:
+            vision_enabled_runtime = False
+            logger.error(
+                "Gemini returned 1007 invalid argument while vision was active; disabling vision before reconnect. %s",
+                activity_summary(),
+            )
+            print("[Vision] Disabled automatically after Gemini 1007 invalid-argument disconnect")
         logger.exception("Speaker/Gemini receive error; %s", activity_summary())
         raise
     finally:
@@ -368,8 +525,11 @@ async def vision_task(session):
                     screenshot = sct.grab(sct.monitors[1])
 
                 img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+                if VISION_MAX_WIDTH and img.width > VISION_MAX_WIDTH:
+                    new_height = max(1, int(img.height * (VISION_MAX_WIDTH / img.width)))
+                    img = img.resize((VISION_MAX_WIDTH, new_height))
                 buffer = io.BytesIO()
-                img.save(buffer, format="JPEG", quality=65)
+                img.save(buffer, format="JPEG", quality=VISION_JPEG_QUALITY)
                 jpeg_bytes = buffer.getvalue()
 
                 await session.send_realtime_input(
@@ -453,6 +613,12 @@ def _format_bridge_message(data: dict):
     if not content:
         return None
 
+    # During voice-only stability tests, suppress automatic idle nudges. Otherwise
+    # Aurora keeps speaking every ~30s about not having vision, which is correct
+    # but annoying and makes mic/listening tests harder. Real chat/questions still pass.
+    if msg_type == "idle_nudge" and not vision_enabled_runtime:
+        return None
+
     username = data.get("username") or "someone"
     context = (data.get("context") or "").strip()
 
@@ -509,6 +675,16 @@ async def hermes_bridge_task(session):
                             pass
                         continue
 
+                    connector_result = await asyncio.to_thread(maybe_handle_connector, text)
+                    if connector_result.handled:
+                        if connector_result.opened_url:
+                            logger.info("🔌 Connector opened URL: %s", connector_result.opened_url)
+                        if connector_result.error:
+                            logger.warning("🔌 Connector returned error: %s", connector_result.error)
+                        text = connector_result.prompt or "[Local connector result] Done."
+
+                    if not vision_enabled_runtime:
+                        text += "\n\n[Runtime note: live screen vision is currently OFF for stability testing. Do not claim to see the screen. If asked to look, say you don't have the visual feed right now.]"
                     logger.info(f"-> Injecting: {text}")
                     try:
                         await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.THINKING)
@@ -530,132 +706,237 @@ async def hermes_bridge_task(session):
             delay = min(delay * 2, 30)
 
 # ==============================================================================
-# MAIN LOOP
+# GEMINI LIVE TOOLS / CONNECTORS
 # ==============================================================================
-async def run_aurora():
-    global gemini_session_started_at
-    if not GOOGLE_API_KEY:
-        logger.error("GOOGLE_API_KEY not found in environment!")
-        return
+WEATHER_FUNCTION_NAME = "get_weather"
+OPEN_BROWSER_FUNCTION_NAME = "open_browser"
+SET_VISION_FUNCTION_NAME = "set_vision"
+REMEMBER_NOTE_FUNCTION_NAME = "remember_note"
+WEB_SEARCH_FUNCTION_NAME = "web_search"
+MARKET_BRIEF_FUNCTION_NAME = "get_market_brief"
+PC_CONTROL_FUNCTION_NAME = "pc_control"
+RECALL_MEMORY_FUNCTION_NAME = "recall_memory"
 
-    client = genai.Client(
-        api_key=GOOGLE_API_KEY,
-        http_options=types.HttpOptions(
-            async_client_args={
-                # websockets defaults to a 10s open timeout. Reconnects after a
-                # dropped Live session can occasionally need longer DNS/TLS/WS
-                # setup time, so give the handshake breathing room.
-                "open_timeout": CONNECT_OPEN_TIMEOUT_SEC,
-                "ping_interval": WS_PING_INTERVAL_SEC,
-                "ping_timeout": WS_PING_TIMEOUT_SEC,
-                "close_timeout": 10,
-            }
+
+def build_live_tools():
+    """Expose safe local connectors to Gemini Live for spoken commands."""
+    tools = [
+        types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name=WEATHER_FUNCTION_NAME,
+                    description="Get current weather for a city/location using a local weather connector.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "location": types.Schema(
+                                type=types.Type.STRING,
+                                description="City/location, e.g. 'Kendal, UK' or 'Manchester, UK'.",
+                            )
+                        },
+                        required=["location"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name=OPEN_BROWSER_FUNCTION_NAME,
+                    description="Open a safe HTTP/HTTPS URL in the local desktop browser.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "url": types.Schema(
+                                type=types.Type.STRING,
+                                description="URL to open, e.g. 'https://google.com' or 'weather.com'.",
+                            )
+                        },
+                        required=["url"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name=SET_VISION_FUNCTION_NAME,
+                    description="Turn Aurora's live screen vision on or off when the user says activate/enable vision or disable/turn off vision.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "enabled": types.Schema(
+                                type=types.Type.BOOLEAN,
+                                description="true to activate vision, false to disable vision.",
+                            )
+                        },
+                        required=["enabled"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name=REMEMBER_NOTE_FUNCTION_NAME,
+                    description="Persist a stable memory only when the user explicitly asks Aurora to remember something.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "note": types.Schema(
+                                type=types.Type.STRING,
+                                description="The concise fact or preference to remember.",
+                            ),
+                            "category": types.Schema(
+                                type=types.Type.STRING,
+                                description="Short category such as user, aurora, tools, trading, health, or relationships.",
+                            ),
+                        },
+                        required=["note"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name=WEB_SEARCH_FUNCTION_NAME,
+                    description="Search the web (free local DuckDuckGo connector) for current events, live facts, game news, or anything not in training data. Returns a summary plus top results.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "query": types.Schema(
+                                type=types.Type.STRING,
+                                description="Focused search query, e.g. 'Elden Ring latest patch notes'.",
+                            )
+                        },
+                        required=["query"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name=MARKET_BRIEF_FUNCTION_NAME,
+                    description="Get a live market brief (S&P 500, Nasdaq, FTSE 100, Bitcoin, GBP/USD) with prices and daily percent change. Use when the user asks about markets, stocks, crypto, or the market forecast.",
+                    parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+                ),
+                types.FunctionDeclaration(
+                    name=PC_CONTROL_FUNCTION_NAME,
+                    description=(
+                        "Control this PC: media/volume keys and opening whitelisted apps. "
+                        f"Actions: {', '.join(MEDIA_ACTIONS)}, open_app. "
+                        f"Apps allowed for open_app: {', '.join(sorted(APP_WHITELIST))}."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "action": types.Schema(
+                                type=types.Type.STRING,
+                                description="One of the listed actions, e.g. 'volume_up', 'media_play_pause', 'open_app'.",
+                            ),
+                            "target": types.Schema(
+                                type=types.Type.STRING,
+                                description="Only for open_app: which whitelisted app to open.",
+                            ),
+                        },
+                        required=["action"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name=RECALL_MEMORY_FUNCTION_NAME,
+                    description="Search Aurora's local long-term memory for relevant facts before answering memory questions.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "query": types.Schema(
+                                type=types.Type.STRING,
+                                description="The memory search query.",
+                            )
+                        },
+                        required=["query"],
+                    ),
+                ),
+            ]
         ),
-    )
-    config = types.LiveConnectConfig(
-        response_modalities=[types.Modality.AUDIO],
-        system_instruction=types.Content(parts=[types.Part.from_text(text=SYSTEM_PROMPT)]),
-        speech_config=types.SpeechConfig(
+    ]
+    if ENABLE_GOOGLE_SEARCH:
+        try:
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
+            logger.info("🔎 Native google_search grounding enabled")
+        except AttributeError:
+            logger.warning("Gemini SDK lacks GoogleSearch type; continuing without search grounding")
+    return tools
+
+
+async def handle_tool_call(session, tool_call) -> None:
+    global vision_enabled_runtime
+    responses = []
+    for call in tool_call.function_calls or []:
+        name = call.name
+        args = dict(call.args or {})
+        try:
+            if name == WEATHER_FUNCTION_NAME:
+                location = str(args.get("location") or "Kendal, UK")
+                summary = await asyncio.to_thread(get_weather_summary, location)
+                response = {"ok": True, "summary": summary}
+                logger.info("🔌 Tool get_weather(%r) -> %s", location, summary)
+            elif name == OPEN_BROWSER_FUNCTION_NAME:
+                url = str(args.get("url") or "")
+                opened_url = await asyncio.to_thread(open_browser_url, url)
+                response = {"ok": True, "opened_url": opened_url}
+                logger.info("🔌 Tool open_browser(%r) -> %s", url, opened_url)
+            elif name == SET_VISION_FUNCTION_NAME:
+                enabled = bool(args.get("enabled"))
+                if enabled and not VISION_AVAILABLE:
+                    response = {"ok": False, "enabled": False, "error": "Vision dependencies are not installed."}
+                    logger.warning("🔌 Tool set_vision(%s) failed: VISION_AVAILABLE=False", enabled)
+                else:
+                    vision_enabled_runtime = enabled
+                    status = "ON" if vision_enabled_runtime else "OFF"
+                    response = {"ok": True, "enabled": vision_enabled_runtime, "status": status}
+                    logger.info("🔌 Tool set_vision(%s) -> %s", enabled, status)
+                    print(f"[Vision] Voice command → {status}")
+            elif name == WEB_SEARCH_FUNCTION_NAME:
+                query = str(args.get("query") or "")
+                summary = await asyncio.to_thread(web_search_summary, query)
+                response = {"ok": True, "results": summary}
+                logger.info("🔎 Tool web_search(%r) -> %d chars", query, len(summary))
+            elif name == MARKET_BRIEF_FUNCTION_NAME:
+                summary = await asyncio.to_thread(get_market_summary)
+                response = {"ok": True, "summary": summary}
+                logger.info("📈 Tool get_market_brief -> %s", summary)
+            elif name == PC_CONTROL_FUNCTION_NAME:
+                action = str(args.get("action") or "")
+                target = str(args.get("target") or "")
+                response = await asyncio.to_thread(pc_control, action, target)
+                logger.info("🖱️ Tool pc_control(%r, %r) -> ok=%s", action, target, response.get("ok"))
+            elif name == REMEMBER_NOTE_FUNCTION_NAME:
+                note = str(args.get("note") or "")
+                category = str(args.get("category") or "general")
+                response = await asyncio.to_thread(aurora_memory_store.remember_note, note, category)
+                logger.info("🧠 Tool remember_note(category=%r) -> ok=%s", category, response.get("ok"))
+            elif name == RECALL_MEMORY_FUNCTION_NAME:
+                query = str(args.get("query") or "")
+                response = await asyncio.to_thread(aurora_memory_store.recall_memory, query)
+                logger.info("🧠 Tool recall_memory(%r) -> %s match(es)", query, len(response.get("matches", [])))
+            else:
+                response = {"ok": False, "error": f"Unknown tool: {name}"}
+                logger.warning("🔌 Unknown tool call: %s args=%s", name, args)
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+            logger.exception("🔌 Tool %s failed", name)
+
+        responses.append(types.FunctionResponse(id=call.id, name=name, response=response))
+
+    if responses:
+        await session.send_tool_response(function_responses=responses)
+        mark_activity("bridge")
+
+
+# ==============================================================================
+# GEMINI LIVE CONFIG / SESSION RESUMPTION
+# ==============================================================================
+def build_live_config():
+    kwargs = {
+        "response_modalities": [types.Modality.AUDIO],
+        "system_instruction": types.Content(parts=[types.Part.from_text(text=current_system_prompt())]),
+        "speech_config": types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_NAME)
             )
-        )
-    )
+        ),
+        "tools": build_live_tools(),
+    }
 
-    await websockets.serve(lip_sync_handler, "localhost", LIPSYNC_WS_PORT)
-    logger.info(f"👄 Lip-sync WebSocket server started on port {LIPSYNC_WS_PORT}")
-    await unreal_avatar_bridge.start()
-    await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.IDLE, force=True)
+    try:
+        # Transcribe both sides so conversations auto-save to daily memory.
+        kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
+        kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
+    except AttributeError:
+        logger.warning("Gemini SDK lacks AudioTranscriptionConfig; conversation auto-capture disabled")
 
-    # Reconnect backoff: starts polite, grows exponentially with jitter, caps at 30s.
-    # Both state variables are RESET inside the async-with on a successful connect, so
-    # a long happy session followed by a brief blip doesn't inherit yesterday's backoff.
-    INITIAL_RECONNECT_DELAY = 2.0
-    MAX_RECONNECT_DELAY = 30.0
-    reconnect_delay = INITIAL_RECONNECT_DELAY
-    consecutive_failures = 0
-
-    while True:
-        tasks = []
+    if ENABLE_GEMINI_CONTEXT_COMPRESSION:
         try:
-            attempt_note = f" (retry #{consecutive_failures + 1})" if consecutive_failures else ""
-            logger.info(f"🔌 Connecting to Gemini Live API ({MODEL_ID}){attempt_note}...")
-            async with client.aio.live.connect(model=MODEL_ID, config=config) as session:
-                gemini_session_started_at = time.time()
-                if consecutive_failures > 0:
-                    logger.info(f"✅ Reconnected after {consecutive_failures} failed attempt(s)")
-                consecutive_failures = 0
-                reconnect_delay = INITIAL_RECONNECT_DELAY
-
-                print("✅ New Gemini Live session ready")
-                logger.info("✨ Aurora is LIVE — start talking!")
-                await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.LISTENING, force=True)
-
-                mic = asyncio.create_task(microphone_task(session))
-                keepalive = asyncio.create_task(keepalive_task(session))
-                speaker = asyncio.create_task(speaker_task(session))
-                bridge = asyncio.create_task(hermes_bridge_task(session))
-                network_probe = asyncio.create_task(network_probe_task())
-                ctrl = asyncio.create_task(control_task())
-
-                tasks = [mic, keepalive, speaker, bridge, network_probe, ctrl]
-
-                if VISION_ENABLED and VISION_AVAILABLE:
-                    vision = asyncio.create_task(vision_task(session))
-                    tasks.append(vision)
-
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-                crash = None
-                for task in done:
-                    try:
-                        task.result()
-                    except Exception as exc:
-                        crash = exc
-                        msg = str(exc).lower()
-                        if "1011" in msg or "keepalive" in msg or "websocket" in msg:
-                            print("🔄 Reconnecting after 1011 keepalive timeout...")
-                        else:
-                            logger.exception("Task crashed before reconnect cleanup; %s", activity_summary())
-
-                for t in pending:
-                    t.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-
-                if crash is not None:
-                    raise crash
-
-        except Exception as e:
-            consecutive_failures += 1
-            msg = str(e).lower()
-            jitter = random.uniform(0, reconnect_delay * 0.3)
-            sleep_for = reconnect_delay + jitter
-
-            if "1011" in msg or "keepalive" in msg or "websocket" in msg:
-                print(f"🔄 Reconnecting after 1011/keepalive (#{consecutive_failures}) "
-                      f"in {sleep_for:.1f}s")
-            elif "timed out" in msg or "timeout" in msg:
-                logger.warning(f"Connect timed out (#{consecutive_failures}); "
-                               f"retrying in {sleep_for:.1f}s")
-            else:
-                logger.exception("Top-level error before reconnect (#%s); retrying in %.1fs; %s", consecutive_failures, sleep_for, activity_summary())
-
-            await asyncio.sleep(sleep_for)
-            reconnect_delay = min(reconnect_delay * 1.8, MAX_RECONNECT_DELAY)
-
-        finally:
-            if is_speaking.is_set():
-                is_speaking.clear()
-            await safe_set_state(unreal_avatar_bridge, AuroraAvatarState.IDLE)
-            await asyncio.sleep(0.4)
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
-async def main():
-    if os.name == "nt":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    await run_aurora()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            kwargs["context_w

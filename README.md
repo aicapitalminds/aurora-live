@@ -1,50 +1,37 @@
-# Aurora Live - Private Project Repository
+# Aurora Live
 
-Aurora is Attila's AI streaming co-host for Twitch/Discord: a real-time voice + Live2D companion that can listen, speak, react visually, and connect to the wider stream automation stack.
+Aurora is a real-time AI streaming co-host: an Unreal Engine 5.8 MetaHuman that listens, talks (Gemini Live voice), lip-syncs, blinks, tracks the camera, and idles naturally — streamed to Twitch via OBS.
 
-This repository is the private source-of-truth backup for the live system.
+This repo contains the **Python voice agent + bridge** and all project docs. The Unreal project (maps, MetaHuman, C++ `AuroraRuntime` plugin) lives separately on the gaming PC (see [UE project](#ue-project-what-you-need-to-recreate)).
 
-## Current live components
+## Architecture
 
-- `aurora-live.py` - Gemini Live voice agent, microphone input, speaker output, screen/vision loop, Live2D lip-sync websocket, Hermes bridge.
-- `aurora-viewer.html` - transparent Live2D browser source for OBS.
-- `check_audio.py` - helper for checking Windows audio/VoiceMeeter devices.
-- `live2d-models/` - local Live2D model assets used by the viewer.
-- `start-aurora.example.bat` - safe template for the local Windows launcher.
+```
+Mic ──> aurora-live.py (Gemini Live API, voice in/out)
+              │
+              ├─ speaker output (24 kHz PCM)
+              ├─ websocket SERVER :8771 ── UE AuroraLiveController (client)
+              │        avatar.audio.pcm (20 ms frames) -> Georgy lipsync
+              │        avatar.state / gestures / text
+              ├─ Hermes bridge (ws://<LAN>:8765, optional)
+              └─ screen/vision loop (mss + Pillow)
 
-## Security rules
-
-Never commit:
-
-- API keys or OAuth tokens
-- `.env` files
-- the real `start-aurora.bat`
-- logs containing runtime/private output
-- private Discord/Twitch/Gemini/Hermes credentials
-- personal viewer data or memory exports
-
-The real launcher currently belongs only on the gaming PC. Use `start-aurora.example.bat` as the committed template.
-
-## Local run notes
-
-Aurora runs on the Windows gaming PC, not WSL, because `sounddevice`/audio routing must see physical Windows devices and VoiceMeeter virtual cables.
-
-Typical Windows launch:
-
-```bat
-cd /d C:\aurora-live
-start-aurora.bat
+UE 5.8 standalone (-game) ──> OBS Window/Game Capture ──> Twitch
 ```
 
-OBS browser source should point at `aurora-viewer.html` or a locally served equivalent.
+## Requirements
 
-## Weekly maintenance ritual
+**Machine** (single Windows gaming PC): Windows 11, decent GPU (built on 7800X3D / 32 GB / 24 GB GPU), physical audio devices (VoiceMeeter virtual cables supported). Runs on Windows, not WSL — `sounddevice` must see real devices.
 
-1. Run a smoke test.
-2. Review changes with `git status` and `git diff`.
-3. Confirm no secrets are staged.
-4. Commit private repo changes.
-5. Push to GitHub.
-6. Update the public showcase repo only with sanitized lessons, diagrams, and safe examples.
+**Software**
+- Python 3.12+ (`pip install -r requirements.txt` in a venv)
+- Unreal Engine 5.8 + MetaHuman plugin
+- [Runtime MetaHuman Lip Sync](https://georgy.dev) plugin by Georgy Dev (realistic NN lipsync)
+- OBS Studio
+- A Google AI Studio API key (Gemini Live)
+- Optional: Epic's official ModelContextProtocol UE plugin + `cloudflared` if you want an AI agent to edit the project live (see `Aurora_UE_MCP_Integration.md`)
 
-See `docs/smoke-tests.md`, `docs/runbook.md`, and `docs/weekly-changelog.md`.
+## Setup
+
+1. Clone into `C:\aurora-live` (paths in the launchers assume this).
+2. `python -m venv .venv && .venv\Scripts\pip i

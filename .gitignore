@@ -44,3 +44,8 @@ screenshots/
 *.mov
 
 # Keep docs/examples safe for GitHub
+
+# Machine-local runtime state
+aurora-gemini-session-state.json
+NUL
+memory/

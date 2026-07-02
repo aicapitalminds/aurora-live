@@ -8,6 +8,7 @@ events consumed by an Unreal-side WebSocket client/controller.
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass, field
 from enum import Enum
 import json
@@ -61,6 +62,66 @@ def build_lipsync_event(values: list[float] | tuple[float, ...], window_ms: int,
     }
 
 
+def build_lipsync_prewarm_event(
+    *,
+    sample_rate: int,
+    channels: int = 1,
+    duration_ms: int = 120,
+    timestamp: float | None = None,
+) -> dict[str, Any]:
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if channels <= 0:
+        raise ValueError("channels must be positive")
+    if duration_ms <= 0:
+        raise ValueError("duration_ms must be positive")
+    return {
+        "type": "avatar.lipsync.prewarm",
+        "sampleRate": int(sample_rate),
+        "channels": int(channels),
+        "durationMs": int(duration_ms),
+        "timestamp": _timestamp(timestamp),
+    }
+
+
+def build_audio_pcm_event(
+    pcm: bytes | bytearray | memoryview,
+    *,
+    sample_rate: int,
+    channels: int = 1,
+    sample_format: str = "float32",
+    sequence: int | None = None,
+    timestamp: float | None = None,
+) -> dict[str, Any]:
+    """Build the future Georgy Runtime MetaHuman Lip Sync audio event.
+
+    This event is intentionally separate from the legacy amplitude event. The
+    Georgy plugin wants real PCM audio chunks so Unreal can play the same audio
+    and feed it into ProcessAudioData on the Runtime MetaHuman Lip Sync
+    generator. Keep chunks small, ideally 20ms at 16kHz mono.
+    """
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if channels <= 0:
+        raise ValueError("channels must be positive")
+    normalized_format = sample_format.lower()
+    if normalized_format not in {"float32", "int16"}:
+        raise ValueError("sample_format must be 'float32' or 'int16'")
+    raw = bytes(pcm)
+    event: dict[str, Any] = {
+        "type": "avatar.audio.pcm",
+        "sampleRate": int(sample_rate),
+        "channels": int(channels),
+        "format": normalized_format,
+        "byteLength": len(raw),
+        "audioBase64": base64.b64encode(raw).decode("ascii"),
+        "timestamp": _timestamp(timestamp),
+    }
+    if sequence is not None:
+        event["seq"] = int(sequence)
+    return event
+
+
 def build_text_event(text: str, partial: bool = False, timestamp: float | None = None) -> dict[str, Any]:
     return {
         "type": "avatar.text.partial" if partial else "avatar.text.final",
@@ -74,6 +135,71 @@ def build_gesture_event(name: str, intensity: float = 1.0, timestamp: float | No
         "type": "avatar.gesture",
         "name": name,
         "intensity": _clamp01(intensity),
+        "timestamp": _timestamp(timestamp),
+    }
+
+
+def build_world_context_event(
+    avatar: dict[str, Any],
+    nearby: list[dict[str, Any]] | None = None,
+    *,
+    scene: str | None = None,
+    timestamp: float | None = None,
+) -> dict[str, Any]:
+    """Describe nearby Unreal world state for Hermes/Gemini grounding.
+
+    Unreal can emit this from overlap spheres, gameplay tags, or perception scans.
+    Keep it small: labels/tags/relative positions beat raw actor dumps.
+    """
+    event: dict[str, Any] = {
+        "type": "world.context",
+        "avatar": avatar,
+        "nearby": list(nearby or []),
+        "timestamp": _timestamp(timestamp),
+    }
+    if scene:
+        event["scene"] = scene
+    return event
+
+
+def build_world_action_event(
+    action: str,
+    *,
+    target: str | None = None,
+    params: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    timestamp: float | None = None,
+) -> dict[str, Any]:
+    """Command Unreal to perform a world/avatar action."""
+    event: dict[str, Any] = {
+        "type": "world.action",
+        "action": action,
+        "params": dict(params or {}),
+        "timestamp": _timestamp(timestamp),
+    }
+    if target is not None:
+        event["target"] = target
+    if request_id is not None:
+        event["requestId"] = request_id
+    return event
+
+
+def build_world_action_result_event(
+    request_id: str,
+    *,
+    ok: bool,
+    action: str | None = None,
+    message: str = "",
+    data: dict[str, Any] | None = None,
+    timestamp: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": "world.action.result",
+        "requestId": request_id,
+        "ok": bool(ok),
+        "action": action,
+        "message": message,
+        "data": dict(data or {}),
         "timestamp": _timestamp(timestamp),
     }
 
@@ -96,6 +222,9 @@ class UnrealAvatarBridge:
                 # The Unreal side may send pings/acks/control messages later. Keep
                 # handling permissive so experimental controllers don't kill the bridge.
                 self.logger.debug("Unreal avatar client message: %s", str(raw)[:300])
+        except websockets.ConnectionClosed:
+            # Normal during Unreal Play stop or when short-lived test pulse servers shut down.
+            self.logger.info("🎭 Unreal avatar client connection closed")
         finally:
             self.clients.discard(websocket)
             self.logger.info("🎭 Unreal avatar client disconnected (%s total)", len(self.clients))
@@ -138,11 +267,72 @@ class UnrealAvatarBridge:
     async def send_lipsync(self, values: list[float] | tuple[float, ...], window_ms: int, *, timestamp: float | None = None) -> None:
         await self.broadcast(build_lipsync_event(values, window_ms=window_ms, timestamp=timestamp))
 
+    async def send_lipsync_prewarm(
+        self,
+        *,
+        sample_rate: int,
+        channels: int = 1,
+        duration_ms: int = 120,
+        timestamp: float | None = None,
+    ) -> None:
+        await self.broadcast(
+            build_lipsync_prewarm_event(
+                sample_rate=sample_rate,
+                channels=channels,
+                duration_ms=duration_ms,
+                timestamp=timestamp,
+            )
+        )
+
+    async def send_audio_pcm(
+        self,
+        pcm: bytes | bytearray | memoryview,
+        *,
+        sample_rate: int,
+        channels: int = 1,
+        sample_format: str = "float32",
+        sequence: int | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        await self.broadcast(
+            build_audio_pcm_event(
+                pcm,
+                sample_rate=sample_rate,
+                channels=channels,
+                sample_format=sample_format,
+                sequence=sequence,
+                timestamp=timestamp,
+            )
+        )
+
     async def send_text(self, text: str, *, partial: bool = False, timestamp: float | None = None) -> None:
         await self.broadcast(build_text_event(text, partial=partial, timestamp=timestamp))
 
     async def send_gesture(self, name: str, *, intensity: float = 1.0, timestamp: float | None = None) -> None:
         await self.broadcast(build_gesture_event(name, intensity=intensity, timestamp=timestamp))
+
+    async def send_world_context(
+        self,
+        avatar: dict[str, Any],
+        nearby: list[dict[str, Any]] | None = None,
+        *,
+        scene: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        await self.broadcast(build_world_context_event(avatar, nearby, scene=scene, timestamp=timestamp))
+
+    async def send_world_action(
+        self,
+        action: str,
+        *,
+        target: str | None = None,
+        params: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        await self.broadcast(
+            build_world_action_event(action, target=target, params=params, request_id=request_id, timestamp=timestamp)
+        )
 
 
 async def safe_set_state(bridge: UnrealAvatarBridge | None, state: str | AuroraAvatarState, **kwargs) -> None:
@@ -158,6 +348,44 @@ async def safe_send_lipsync(bridge: UnrealAvatarBridge | None, values: list[floa
     if bridge is None:
         return
     try:
-        await bridge.send_lipsync(values, window_ms)
+        await bridge.send_lipsync(values, window_ms=window_ms)
     except Exception:
         bridge.logger.exception("Unreal avatar lip-sync update failed")
+
+
+async def safe_send_lipsync_prewarm(
+    bridge: UnrealAvatarBridge | None,
+    *,
+    sample_rate: int,
+    channels: int = 1,
+    duration_ms: int = 120,
+) -> None:
+    if bridge is None:
+        return
+    try:
+        await bridge.send_lipsync_prewarm(sample_rate=sample_rate, channels=channels, duration_ms=duration_ms)
+    except Exception:
+        bridge.logger.exception("Unreal avatar lip-sync prewarm failed")
+
+
+async def safe_send_audio_pcm(
+    bridge: UnrealAvatarBridge | None,
+    pcm: bytes | bytearray | memoryview,
+    *,
+    sample_rate: int,
+    channels: int = 1,
+    sample_format: str = "float32",
+    sequence: int | None = None,
+) -> None:
+    if bridge is None:
+        return
+    try:
+        await bridge.send_audio_pcm(
+            pcm,
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_format=sample_format,
+            sequence=sequence,
+        )
+    except Exception:
+        bridge.logger.exception("Unreal avatar PCM audio update failed")

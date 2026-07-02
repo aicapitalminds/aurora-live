@@ -1,0 +1,8 @@
+# Aurora voice agent (Python 3.12+; developed on 3.14 / Windows)
+google-genai>=1.0        # Gemini Live API (voice)
+websockets>=13           # UE avatar bridge server (port 8771) + Hermes client
+sounddevice>=0.5         # mic/speaker I/O (needs physical Windows audio devices)
+numpy>=1.26              # audio buffers
+Pillow>=10               # screen/vision capture frames
+mss>=9                   # fast screen grabs for the vision loop
+requests>=2.31           # misc HTTP
