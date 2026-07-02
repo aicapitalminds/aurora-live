@@ -2,7 +2,17 @@
 
 Aurora is a real-time AI streaming co-host: an Unreal Engine 5.8 MetaHuman that listens, talks (Gemini Live voice), lip-syncs, blinks, tracks the camera, and idles naturally — streamed to Twitch via OBS.
 
-This repo contains the **Python voice agent + bridge** and all project docs. The Unreal project (maps, MetaHuman, C++ `AuroraRuntime` plugin) lives separately on the gaming PC (see [UE project](#ue-project-what-you-need-to-recreate)).
+This repo contains the **Python voice agent + bridge** and all project docs, shared so you can copy it and build your own AI co-host. The Unreal project (maps, MetaHuman, C++ `AuroraRuntime` plugin) lives separately on the gaming PC (see [UE project](#ue-project-what-you-need-to-recreate)).
+
+## Cost
+
+Everything is free except one plugin:
+
+- Unreal Engine 5.8, MetaHuman plugin, OBS — free
+- All 3D assets (gaming room, wardrobe, props) — free from [Fab](https://fab.com)
+- The character — stock MetaHuman **Zeva** preset, modified in the MetaHuman Character editor (skin, eyes, body, wardrobe); no paid character assets
+- Gemini API — free tier works for testing; live use needs a paid key
+- **[Runtime MetaHuman Lip Sync](https://georgy.dev) by Georgy Dev — the only paid component** (realistic NN lipsync; its blink/eyes-aim nodes are used too)
 
 ## Architecture
 
@@ -21,17 +31,4 @@ UE 5.8 standalone (-game) ──> OBS Window/Game Capture ──> Twitch
 
 ## Requirements
 
-**Machine** (single Windows gaming PC): Windows 11, decent GPU (built on 7800X3D / 32 GB / 24 GB GPU), physical audio devices (VoiceMeeter virtual cables supported). Runs on Windows, not WSL — `sounddevice` must see real devices.
-
-**Software**
-- Python 3.12+ (`pip install -r requirements.txt` in a venv)
-- Unreal Engine 5.8 + MetaHuman plugin
-- [Runtime MetaHuman Lip Sync](https://georgy.dev) plugin by Georgy Dev (realistic NN lipsync)
-- OBS Studio
-- A Google AI Studio API key (Gemini Live)
-- Optional: Epic's official ModelContextProtocol UE plugin + `cloudflared` if you want an AI agent to edit the project live (see `Aurora_UE_MCP_Integration.md`)
-
-## Setup
-
-1. Clone into `C:\aurora-live` (paths in the launchers assume this).
-2. `python -m venv .venv && .venv\Scripts\pip i
+**Machine** (single Windows gaming PC): Windows 11, decent GPU (built on 7800X3D / 32 GB / 24 GB GPU), physical audio devices (VoiceMeeter virtual cables support
