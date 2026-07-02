@@ -1,0 +1,28 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Aurora Runtime",
+  "Description": "Runtime WebSocket bridge receiver for Aurora MetaHuman avatar state, lip-sync, text, and gesture events.",
+  "Category": "Aurora",
+  "CreatedBy": "Hermes Agent",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Modules": [
+    {
+      "Name": "AuroraRuntime",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "AuroraRuntimeEditor",
+      "Type": "UncookedOnly",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "RuntimeMetaHumanLipSync",
+      "Enabled": true
+    }
+  
