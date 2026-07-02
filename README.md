@@ -81,7 +81,6 @@ Detailed plans/history: `Aurora_Roadmap.md`, `Aurora_FaceAnimBP_Idle_Plan.md`, `
 | `Launch_Aurora_Stream.bat` | One-click stream launcher (voice agent + UE standalone) |
 | `start-aurora.example.bat` | Template for the secret-holding local launcher |
 | `tests/`, `smoke_unreal_bridge_ws.py` | Unit + smoke tests |
-| `aurora-viewer.html`, `live2d-models/` | Legacy Live2D pipeline (pre-MetaHuman) |
 | `docs/` | Runbook, smoke tests, changelog |
 
 ## Security rules
