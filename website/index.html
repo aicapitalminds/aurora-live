@@ -97,7 +97,7 @@ nav .btn{padding:9px 18px;font-size:.72rem}
 .marq{position:fixed;bottom:0;left:0;right:0;z-index:60;overflow:hidden;border-top:1px solid rgba(255,47,179,.25);
   background:rgba(4,4,14,.82);backdrop-filter:blur(12px);padding:11px 0;white-space:nowrap;
   box-shadow:0 -6px 30px rgba(255,47,179,.12)}
-.marq div{display:inline-block;animation:marq 22s linear infinite;font-family:Orbitron;font-size:.8rem;letter-spacing:.3em;color:var(--dim)}
+.marq div{display:inline-block;width:max-content;animation:marq 44s linear infinite;font-family:Orbitron;font-size:.8rem;letter-spacing:.3em;color:var(--dim)}
 .marq b{color:var(--pink);margin:0 18px;text-shadow:0 0 10px var(--pink)}
 @keyframes marq{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 
@@ -342,7 +342,7 @@ for(let i=0;i<28;i++){const b=document.createElement('i');
 
 /* ---------- marquee ---------- */
 const items='NEURAL LIPSYNC<b>✦</b>GEMINI LIVE VOICE<b>✦</b>METAHUMAN RENDER<b>✦</b>SEES YOUR GAMEPLAY<b>✦</b>TWITCH CHAT MEMORY<b>✦</b>OBS AUTOMATION<b>✦</b>OPEN SOURCE<b>✦</b>';
-document.getElementById('ticker').innerHTML=items+items;
+document.getElementById('ticker').innerHTML=items.repeat(4);
 
 /* ---------- scroll progress + reveals ---------- */
 addEventListener('scroll',()=>{const h=document.documentElement;
