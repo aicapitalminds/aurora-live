@@ -49,3 +49,4 @@ screenshots/
 aurora-gemini-session-state.json
 NUL
 memory/
+!website/media/*.mp4
